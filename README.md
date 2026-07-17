@@ -51,7 +51,7 @@ Estas son limitaciones del navegador y de YouTube, no de la app:
 - **No se puede mostrar cuál es el tema siguiente ni el anterior.** El reproductor sólo expone `org.mpris.MediaPlayer2.Player`; no implementa la interfaz `TrackList`, así que la cola de reproducción no está publicada en DBus. La única forma de leerla sería una extensión de navegador que mire el DOM de la página.
 - **El tooltip no puede tener botones.** Lo dibuja Plasma y la app sólo aporta texto e imagen; tampoco recibe aviso del hover. Por eso los controles viven en la ventana del click derecho.
 - **El menú del tray no puede tener un slider.** `com.canonical.dbusmenu` sólo define ítems, separadores, iconos y checkboxes. Por eso el click derecho abre una ventana propia en vez del menú de Plasma: es la única forma de tener un slider arrastrable.
-- **Si otra pestaña del navegador reproduce algo, YouTube desaparece de DBus.** El navegador publica una sola sesión de medios (la activa), así que si mirás un video en otra pestaña, ni esta app ni el widget de medios de Plasma pueden ver el YouTube de la otra ventana.
+- **Si otra pestaña reproduce algo, YouTube desaparece de MPRIS.** El navegador publica una sola sesión de medios por fuente, así que el widget de medios de Plasma directamente pierde de vista a YouTube. Esta app lo resuelve con un respaldo (ver abajo): el icono sigue en rojo, aunque sin controles.
 - **"Anterior" casi nunca retrocede.** YouTube declara `CanGoPrevious=true`, pero su handler reinicia el tema actual en vez de ir al anterior. Comprobado llamándolo directo al reproductor, salteando esta app.
 - **"Siguiente" depende de la página.** Funciona cuando YouTube registra los handlers de MediaSession (típico en playlists y en YouTube Music). En algunos videos publica `CanGoNext=false` y no hay nada que hacer.
 
@@ -135,6 +135,7 @@ pkill -f youtube_tray.py     # los mata a todos
 
 - `YouTubePlayer` — cliente MPRIS. Descubre los buses `org.mpris.MediaPlayer2.*`, se queda con el que suena YouTube y escucha `PropertiesChanged` / `NameOwnerChanged` para actualizarse al toque (más un poll cada 5s de red de seguridad).
 - `TrayIcon` — `org.kde.StatusNotifierItem`, el mismo patrón que usa `popup-linux`.
+- Respaldo por pestañas — si MPRIS pierde a YouTube, se consulta el `/TabsRunner` de la extensión de Plasma (`org.kde.krunner1`). Lista **todas** las pestañas sin importar cuál tiene el foco, y sólo le ofrece la acción `MUTE` a la que está emitiendo audio: con eso alcanza para saber que YouTube sigue sonando y mantener el icono rojo. La consulta cuesta ~3 ms y sólo se hace cuando MPRIS falla.
 - `VolumePopup` — la ventana en tkinter con el slider. Corre en el hilo principal; DBus corre en el hilo de GLib y se comunican por una cola (tkinter no es thread-safe).
 
 ### Detalle: por qué se prefiere plasma-browser-integration

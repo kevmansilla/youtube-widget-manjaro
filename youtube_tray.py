@@ -31,6 +31,15 @@ YT_HINTS = ('youtube.com', 'youtu.be', 'ytimg.com', 'googlevideo.com')
 PLASMA_INTEGRATION = 'plasma-browser-integration'
 VOLUME_STEP = 0.05
 
+# El navegador publica UNA sola sesión de medios por fuente MPRIS: si otra
+# pestaña reproduce algo, YouTube desaparece del bus. El runner de pestañas
+# de la extensión de Plasma, en cambio, lista todas las pestañas abiertas
+# sin importar cuál tiene el foco, y sólo le ofrece la acción MUTE a la que
+# está emitiendo audio. Eso alcanza para saber que YouTube sigue sonando.
+PLASMA_SERVICE = 'org.mpris.MediaPlayer2.plasma-browser-integration'
+TABS_RUNNER_PATH = '/TabsRunner'
+KRUNNER_IFACE = 'org.kde.krunner1'
+
 # "(11) Tema - YouTube" -> "Tema". Los navegadores publican el título de la
 # pestaña tal cual: contador de notificaciones al frente y sufijo del sitio.
 _TAB_COUNT_RE = re.compile(r'^\(\d+\)\s*')
@@ -62,6 +71,9 @@ class YouTubePlayer:
         self.status = 'Stopped'
         self.identity = ''
         self.art_url = ''
+        # Sólo se usa cuando MPRIS perdió a YouTube: id de la pestaña que
+        # está sonando, para poder saltar a ella.
+        self.tab_id = None
         # youtube.com/watch no registra los handlers de MediaSession para
         # siguiente/anterior, así que el navegador los publica como false.
         # YouTube Music sí. Hay que respetarlo: si no, quedan botones muertos.
@@ -118,6 +130,30 @@ class YouTubePlayer:
         title = _first(meta.get('xesam:title')).strip().lower()
         return title.endswith('- youtube') or title.endswith('- youtube music')
 
+    def playing_youtube_tab(self):
+        """Pestaña de YouTube que está emitiendo audio, vía el runner de
+        pestañas de Plasma. Devuelve None si no hay ninguna.
+
+        Se usa sólo como respaldo de MPRIS: da el título y permite ir a la
+        pestaña, pero no play/pausa ni volumen.
+        """
+        try:
+            obj = self._bus.get_object(PLASMA_SERVICE, TABS_RUNNER_PATH)
+            matches = obj.Match('youtube', dbus_interface=KRUNNER_IFACE,
+                                timeout=2)
+        except dbus.DBusException:
+            return None
+        for m in matches:
+            props = dict(m[5]) if len(m) > 5 else {}
+            url = str(props.get('subtext', '')).lower()
+            if not any(h in url for h in YT_HINTS):
+                continue
+            # MUTE = "silenciar esta pestaña", o sea que está sonando.
+            actions = [str(a) for a in props.get('actions', [])]
+            if 'MUTE' in actions:
+                return {'id': str(m[0]), 'title': clean_title(str(m[1]))}
+        return None
+
     def refresh(self):
         """Elige el player de YouTube: prioriza el que está sonando."""
         best = None
@@ -143,12 +179,20 @@ class YouTubePlayer:
                 best_rank, best = rank, (name, props, meta, status)
 
         if best is None:
-            changed = self.bus_name is not None
+            # MPRIS no ve YouTube: puede que otra pestaña le haya robado la
+            # sesión de medios. El runner de pestañas sigue viéndolo.
+            tab = self.playing_youtube_tab()
+            nuevo = (None, tab['title'] if tab else '',
+                     tab['id'] if tab else None,
+                     'Playing' if tab else 'Stopped')
+            actual = (self.bus_name, self.title, self.tab_id, self.status)
             self.bus_name = None
-            self.title = self.artist = self.identity = self.art_url = ''
-            self.status = 'Stopped'
+            self.title = tab['title'] if tab else ''
+            self.tab_id = tab['id'] if tab else None
+            self.status = 'Playing' if tab else 'Stopped'
+            self.artist = self.identity = self.art_url = ''
             self.can_next = self.can_prev = False
-            if changed:
+            if nuevo != actual:
                 self._on_change()
             return
 
@@ -179,6 +223,7 @@ class YouTubePlayer:
                 self.bus_name, self.title, self.artist, self.status,
                 self.art_url, self.can_next, self.can_prev, self.volume):
             self.bus_name = name
+            self.tab_id = None       # volvimos a tener control por MPRIS
             self.title, self.artist = title, artist
             self.status, self.identity = status, identity
             self.art_url = art_url
@@ -255,6 +300,15 @@ class YouTubePlayer:
 
     def raise_window(self):
         if not self.bus_name:
+            # Sin MPRIS todavía podemos saltar a la pestaña por el runner.
+            if self.tab_id:
+                try:
+                    obj = self._bus.get_object(PLASMA_SERVICE,
+                                               TABS_RUNNER_PATH)
+                    obj.Run(self.tab_id, '', dbus_interface=KRUNNER_IFACE,
+                            timeout=2)
+                except dbus.DBusException:
+                    pass
             return
         try:
             obj = self._bus.get_object(self.bus_name, MPRIS_PATH)
@@ -273,8 +327,11 @@ class YouTubePlayer:
         return self.volume <= 0.001
 
     def label(self):
-        if not self.bus_name:
+        if not self.bus_name and not self.tab_id:
             return 'Nada sonando en YouTube'
+        if not self.bus_name:
+            # Modo respaldo: el runner sólo da el título de la pestaña.
+            return '%s  (sin controles)' % self.title[:52]
         # Los títulos de YouTube suelen venir ya como "Artista - Tema", así
         # que anteponer el artista lo duplicaría.
         if self.artist and self.artist.lower() in self.title.lower():
@@ -542,9 +599,10 @@ class VolumePopup:
         self._set_enabled(self._next_btn, p.can_next)
         self._set_enabled(self._play_btn, bool(p.bus_name))
         self._set_enabled(self._mute_btn, bool(p.bus_name))
-        self._tab_btn.configure(
-            fg=TEXT_DIM if p.bus_name else TEXT_OFF)
-        self._tab_btn._enabled = bool(p.bus_name)
+        # Sin MPRIS pero con pestaña detectada, saltar a ella sigue andando.
+        puede_ir = bool(p.bus_name or p.tab_id)
+        self._tab_btn.configure(fg=TEXT_DIM if puede_ir else TEXT_OFF)
+        self._tab_btn._enabled = puede_ir
         self._draw()
 
     def _cancel_hide(self, _e=None):
