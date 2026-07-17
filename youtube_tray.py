@@ -228,10 +228,9 @@ class YouTubePlayer:
             self.status, self.identity = status, identity
             self.art_url = art_url
             self.can_next, self.can_prev = can_next, can_prev
-            if raw_volume > 0:
-                self._volume_before_mute = raw_volume
             self.volume = volume
             self.raw_volume = raw_volume
+            self._volume_before_mute = raw_volume
             self._on_change()
 
     # --- señales ---
