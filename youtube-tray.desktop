@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=YouTube Widget
+Comment=Controla la musica de YouTube desde el system tray
+Exec=/home/kevin/youtube-widget-manjaro/youtube-tray.sh
+Icon=/home/kevin/youtube-widget-manjaro/youtube-tray.png
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;
+StartupNotify=false

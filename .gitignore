@@ -1,0 +1,19 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+
+# Entornos virtuales (la app usa el python del sistema, pero por las dudas)
+env/
+venv/
+.venv/
+
+# Editores
+.vscode/
+.idea/
+*.swp
+
+# Sistema
+.DS_Store
+
+# Nota: youtube-tray.png SI se commitea. Lo genera create_tray_icon_image(),
+# pero el .desktop lo necesita, asi que un clon nuevo tiene que traerlo.
