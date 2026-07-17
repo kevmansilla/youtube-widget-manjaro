@@ -86,6 +86,12 @@ class YouTubePlayer:
         self.volume = 0.0
         self.raw_volume = 0.0
         self._volume_before_mute = 1.0
+        # Volumen que el usuario configuró desde la app. YouTube reinicia el
+        # volumen de la página al cambiar de canción; guardamos el elegido para
+        # reponerlo. None hasta conocer el primero (se siembra al arrancar).
+        self.desired_volume = None
+        # Bus del player que realmente controla el volumen (plasma-integration).
+        self._volume_bus = None
 
         self._bus.add_signal_receiver(
             self._on_props_changed,
@@ -158,6 +164,14 @@ class YouTubePlayer:
         """Elige el player de YouTube: prioriza el que está sonando."""
         best = None
         best_rank = -1
+        # El Volume del MPRIS nativo del navegador es un valor fijo (1.0) que no
+        # refleja el volumen real de la página y encima ignora las escrituras. El
+        # bueno es el de plasma-browser-integration. Lo capturamos aparte para no
+        # adoptar nunca el 1.0 basura: durante un cambio de tema el player de
+        # plasma parpadea de estado y el ranking elige un instante al nativo, y
+        # ahí es cuando el volumen "saltaba solo" al 100%.
+        plasma_vol = None
+        plasma_name = None
         for name in self._players():
             props = self._props_of(name)
             if props is None:
@@ -173,6 +187,12 @@ class YouTubePlayer:
             # ya separados en vez del título crudo de la pestaña.
             if PLASMA_INTEGRATION in name:
                 rank += 5
+                plasma_name = name
+                if 'Volume' in props:
+                    try:
+                        plasma_vol = float(props['Volume'])
+                    except (TypeError, ValueError):
+                        pass
             if name == self.bus_name:
                 rank += 1
             if rank > best_rank:
@@ -187,6 +207,7 @@ class YouTubePlayer:
                      'Playing' if tab else 'Stopped')
             actual = (self.bus_name, self.title, self.tab_id, self.status)
             self.bus_name = None
+            self._volume_bus = None
             self.title = tab['title'] if tab else ''
             self.tab_id = tab['id'] if tab else None
             self.status = 'Playing' if tab else 'Stopped'
@@ -216,7 +237,35 @@ class YouTubePlayer:
         # Se redondea sólo para comparar: el navegador reporta el volumen con
         # micro-variaciones que dispararían un refresh por nada. El valor sin
         # redondear es el que se guarda, así el mute restaura el exacto.
-        raw_volume = float(props.get('Volume', 0.0))
+        # Si plasma-browser-integration está presente, su Volume manda (es el
+        # real y escribible). Sólo caemos al del player elegido cuando no hay
+        # integración de plasma en absoluto.
+        if plasma_vol is not None:
+            raw_volume = plasma_vol
+        else:
+            raw_volume = float(props.get('Volume', 0.0))
+
+        # El player al que hay que escribirle el volumen es el de plasma; el
+        # MPRIS nativo del navegador ignora las escrituras.
+        self._volume_bus = plasma_name or name
+
+        # --- Mantener el volumen configurado ---
+        # Sembramos el primer volumen conocido como el "deseado".
+        if self.desired_volume is None and raw_volume > 0:
+            self.desired_volume = raw_volume
+        # YouTube reinicia el volumen de la página al cambiar de canción (manda
+        # el cambio de metadata y el reset de volumen en señales separadas, así
+        # que detectar "cambió la pista" no alcanza: hay que enforcar siempre).
+        # Cualquier desvío respecto al que el usuario configuró se corrige
+        # reescribiendo el deseado y mostrando ese valor —no el salto—. El
+        # usuario sólo cambia el volumen desde el widget (que actualiza
+        # desired vía set_volume), así que no hay con qué pelear salvo los
+        # reinicios de YouTube.
+        if (self.desired_volume is not None and plasma_vol is not None and
+                abs(raw_volume - self.desired_volume) > 0.05):
+            self._write_volume(self.desired_volume)
+            raw_volume = self.desired_volume
+
         volume = round(raw_volume, 3)
         if (name, title, artist, status, art_url, can_next, can_prev,
                 volume) != (
@@ -230,7 +279,10 @@ class YouTubePlayer:
             self.can_next, self.can_prev = can_next, can_prev
             self.volume = volume
             self.raw_volume = raw_volume
-            self._volume_before_mute = raw_volume
+            # IMPORTANTE: Si el volumen es mayor que 0, lo consideramos el volumen actual.
+            # Si es 0, es que está silenciado, así que no deberíamos "restaurar" algo
+            # que no conocemos, pero para evitar el salto al 100%, lo inicializamos.
+            self._volume_before_mute = raw_volume if raw_volume > 0 else 1.0
             self._on_change()
 
     # --- señales ---
@@ -263,15 +315,36 @@ class YouTubePlayer:
     def previous(self):
         self._call('Previous')
 
-    def set_volume(self, target):
-        if not self.bus_name:
-            return
-        target = min(1.0, max(0.0, target))
+    def _write_volume(self, target):
+        """Escribe el volumen al player que lo controla (plasma). Devuelve
+        True si se pudo escribir. No toca el estado interno ni dispara guards:
+        lo usan tanto set_volume (con guard) como la reposición por cambio de
+        canción (que necesita escribir aunque el estado interno ya muestre el
+        valor deseado)."""
+        bus = self._volume_bus or self.bus_name
+        if not bus:
+            return False
         try:
-            obj = self._bus.get_object(self.bus_name, MPRIS_PATH)
+            obj = self._bus.get_object(bus, MPRIS_PATH)
             obj.Set(MPRIS_PLAYER_IFACE, 'Volume', dbus.Double(target),
                     dbus_interface=dbus.PROPERTIES_IFACE)
+            return True
         except dbus.DBusException:
+            return False
+
+    def set_volume(self, target):
+        if not (self._volume_bus or self.bus_name):
+            return
+        target = min(1.0, max(0.0, target))
+        # Un nivel real (>0) elegido por el usuario pasa a ser el volumen
+        # "deseado" que reponemos al cambiar de canción. El 0 del mute no cuenta:
+        # es temporal y no queremos que se convierta en el volumen a mantener.
+        if target > 0.0005:
+            self.desired_volume = target
+        # Si el volumen es casi igual al que ya tenemos, no hagamos nada para evitar bucles.
+        if abs(target - self.raw_volume) < 0.001:
+            return
+        if not self._write_volume(target):
             self.refresh()
             return
         # Se refleja al toque; PropertiesChanged confirma el valor real.
@@ -289,12 +362,13 @@ class YouTubePlayer:
         if not self.bus_name:
             return
         if self.is_muted:
-            self.set_volume(self._volume_before_mute or 1.0)
+            # Al desmutear, usamos el volumen guardado. 
+            # Si no hay uno válido, usamos 1.0 por seguridad.
+            self.set_volume(self._volume_before_mute if self._volume_before_mute > 0 else 1.0)
             return
-        # Guardar ANTES de escribir: el navegador tarda en aplicar el cambio,
-        # así que releerlo acá devolvería el volumen viejo. Se guarda el valor
-        # exacto, no el redondeado, para restaurar el original tal cual.
-        self._volume_before_mute = self.raw_volume or 1.0
+        # Guardar el volumen actual ANTES de silenciar.
+        # Usamos raw_volume para tener la precisión máxima.
+        self._volume_before_mute = self.raw_volume
         self.set_volume(0.0)
 
     def raise_window(self):
