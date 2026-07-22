@@ -3,9 +3,11 @@ os.environ['QT_LOGGING_RULES'] = '*.debug=false;qt.qpa.*=false'
 
 import fcntl
 import io
+import json
 import queue
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -59,6 +61,85 @@ def _first(value, default=''):
     return str(value)
 
 
+# --- Volumen por PipeWire (stream de audio del navegador) ---
+# El Volume que YouTube expone por MPRIS es el del reproductor *dentro de la
+# página*, y YouTube lo reinicia solo en cada canción (medido: 0.11 -> 0.59 al
+# pasar de tema). Por eso el nivel real lo maneja el stream del navegador en
+# PipeWire, una capa que la página no puede tocar, y el de la página queda
+# clavado en 100%.
+BROWSER_HINTS = ('brave', 'chrome', 'chromium', 'firefox', 'vivaldi', 'opera')
+# pactl expresa el volumen en enteros donde 65536 == 100%.
+PA_NORM = 65536.0
+
+
+def _pactl(*args, parse=False):
+    """Corre pactl. Con parse=True devuelve el JSON; si no, True/False."""
+    cmd = ['pactl'] + (['-f', 'json'] if parse else []) + list(args)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None if parse else False
+    if res.returncode != 0:
+        return None if parse else False
+    if not parse:
+        return True
+    try:
+        return json.loads(res.stdout)
+    except ValueError:
+        return None
+
+
+def browser_sink_inputs():
+    """Streams de reproducción que pertenecen al navegador."""
+    data = _pactl('list', 'sink-inputs', parse=True)
+    if not data:
+        return []
+    found = []
+    for si in data:
+        props = si.get('properties') or {}
+        haystack = ' '.join(str(props.get(k, '')) for k in (
+            'application.process.binary', 'application.name', 'node.name')).lower()
+        if any(hint in haystack for hint in BROWSER_HINTS):
+            found.append(si)
+    return found
+
+
+def stream_volume():
+    """Volumen 0..1 del stream del navegador, o None si no hay ninguno."""
+    for si in browser_sink_inputs():
+        values = [c.get('value', 0) for c in (si.get('volume') or {}).values()]
+        if values:
+            return max(values) / PA_NORM
+    return None
+
+
+# Arrastrar el slider dispara hasta ~8 escrituras por segundo y listar los
+# streams en cada una duplicaría los subprocesos. Los índices casi no cambian,
+# así que se cachean un rato; si una escritura falla, se invalida al toque.
+_SINK_TTL = 2.0
+_sink_ids = {'t': 0.0, 'ids': []}
+
+
+def browser_sink_ids():
+    if _sink_ids['ids'] and time.monotonic() - _sink_ids['t'] < _SINK_TTL:
+        return _sink_ids['ids']
+    _sink_ids['ids'] = [si['index'] for si in browser_sink_inputs()]
+    _sink_ids['t'] = time.monotonic()
+    return _sink_ids['ids']
+
+
+def set_stream_volume(value):
+    """Fija el volumen (0..1) de todos los streams del navegador."""
+    pct = max(0, min(100, int(round(value * 100))))
+    ok = False
+    for idx in browser_sink_ids():
+        if _pactl('set-sink-input-volume', str(idx), '%d%%' % pct):
+            ok = True
+    if not ok:
+        _sink_ids['t'] = 0.0      # índices viejos: reconstruir en el próximo intento
+    return ok
+
+
 class YouTubePlayer:
     """Cliente MPRIS que sigue al navegador que está reproduciendo YouTube."""
 
@@ -85,13 +166,14 @@ class YouTubePlayer:
         # guarda el exacto, que es el que hay que restaurar al desilenciar.
         self.volume = 0.0
         self.raw_volume = 0.0
-        self._volume_before_mute = 1.0
-        # Volumen que el usuario configuró desde la app. YouTube reinicia el
-        # volumen de la página al cambiar de canción; guardamos el elegido para
-        # reponerlo. None hasta conocer el primero (se siembra al arrancar).
-        self.desired_volume = None
-        # Bus del player que realmente controla el volumen (plasma-integration).
+        # Mutear = clavar el volumen de página de YouTube en 0 (en vez de 100%),
+        # así el silencio afecta sólo a la pestaña de YouTube y no al resto del
+        # navegador. El nivel del slider (PipeWire) queda intacto mientras tanto.
+        self.muted = False
+        # Bus del player cuyo volumen de página fijamos.
         self._volume_bus = None
+        # Ya trasladamos el nivel audible de la página al stream de PipeWire.
+        self._page_pinned = False
 
         self._bus.add_signal_receiver(
             self._on_props_changed,
@@ -237,35 +319,35 @@ class YouTubePlayer:
         # Se redondea sólo para comparar: el navegador reporta el volumen con
         # micro-variaciones que dispararían un refresh por nada. El valor sin
         # redondear es el que se guarda, así el mute restaura el exacto.
-        # Si plasma-browser-integration está presente, su Volume manda (es el
-        # real y escribible). Sólo caemos al del player elegido cuando no hay
-        # integración de plasma en absoluto.
-        if plasma_vol is not None:
-            raw_volume = plasma_vol
-        else:
-            raw_volume = float(props.get('Volume', 0.0))
-
-        # El player al que hay que escribirle el volumen es el de plasma; el
-        # MPRIS nativo del navegador ignora las escrituras.
+        # El player al que hay que escribirle el volumen de página es el de
+        # plasma; el MPRIS nativo del navegador ignora las escrituras.
         self._volume_bus = plasma_name or name
+        stream_vol = stream_volume()
 
-        # --- Mantener el volumen configurado ---
-        # Sembramos el primer volumen conocido como el "deseado".
-        if self.desired_volume is None and raw_volume > 0:
-            self.desired_volume = raw_volume
-        # YouTube reinicia el volumen de la página al cambiar de canción (manda
-        # el cambio de metadata y el reset de volumen en señales separadas, así
-        # que detectar "cambió la pista" no alcanza: hay que enforcar siempre).
-        # Cualquier desvío respecto al que el usuario configuró se corrige
-        # reescribiendo el deseado y mostrando ese valor —no el salto—. El
-        # usuario sólo cambia el volumen desde el widget (que actualiza
-        # desired vía set_volume), así que no hay con qué pelear salvo los
-        # reinicios de YouTube.
-        if (self.desired_volume is not None and plasma_vol is not None and
-                abs(raw_volume - self.desired_volume) > 0.05):
-            self._write_volume(self.desired_volume)
-            raw_volume = self.desired_volume
+        # Dejamos el volumen de la página de YouTube clavado en 100%: es el que
+        # YouTube reinicia por su cuenta en cada canción. El nivel audible lo
+        # lleva el stream de PipeWire. La primera vez trasladamos el nivel actual
+        # al stream (stream * página) para no pegar un bocinazo al subir la
+        # página al 100%.
+        # El volumen de página es nuestro: 100% normalmente, 0 si el usuario
+        # muteó. Reescribirlo en cada desvío es lo que sostiene el mute (y el
+        # nivel) a través de los cambios de canción, que es cuando YouTube lo
+        # reinicia por su cuenta.
+        page_target = 0.0 if self.muted else 1.0
+        if plasma_vol is not None:
+            if not self._page_pinned:
+                # Primera vez: trasladamos el nivel audible de la página al
+                # stream para no pegar un bocinazo al subirla al 100%.
+                if stream_vol is not None and plasma_vol < 0.99 and not self.muted:
+                    stream_vol = max(0.0, min(1.0, stream_vol * plasma_vol))
+                    set_stream_volume(stream_vol)
+                self._page_pinned = True
+            if abs(plasma_vol - page_target) > 0.01:
+                self._write_volume(page_target)
 
+        # El volumen que la app muestra y controla es el del stream. Si PipeWire
+        # no reporta stream (nada sonando todavía) conservamos el último.
+        raw_volume = self.raw_volume if stream_vol is None else stream_vol
         volume = round(raw_volume, 3)
         if (name, title, artist, status, art_url, can_next, can_prev,
                 volume) != (
@@ -279,10 +361,6 @@ class YouTubePlayer:
             self.can_next, self.can_prev = can_next, can_prev
             self.volume = volume
             self.raw_volume = raw_volume
-            # IMPORTANTE: Si el volumen es mayor que 0, lo consideramos el volumen actual.
-            # Si es 0, es que está silenciado, así que no deberíamos "restaurar" algo
-            # que no conocemos, pero para evitar el salto al 100%, lo inicializamos.
-            self._volume_before_mute = raw_volume if raw_volume > 0 else 1.0
             self._on_change()
 
     # --- señales ---
@@ -333,21 +411,14 @@ class YouTubePlayer:
             return False
 
     def set_volume(self, target):
-        if not (self._volume_bus or self.bus_name):
-            return
         target = min(1.0, max(0.0, target))
-        # Un nivel real (>0) elegido por el usuario pasa a ser el volumen
-        # "deseado" que reponemos al cambiar de canción. El 0 del mute no cuenta:
-        # es temporal y no queremos que se convierta en el volumen a mantener.
-        if target > 0.0005:
-            self.desired_volume = target
-        # Si el volumen es casi igual al que ya tenemos, no hagamos nada para evitar bucles.
+        # Si es casi el mismo, no gastamos un pactl de más.
         if abs(target - self.raw_volume) < 0.001:
             return
-        if not self._write_volume(target):
-            self.refresh()
+        # El nivel vive en el stream de PipeWire, no en la página de YouTube:
+        # así no hay nada que YouTube pueda reiniciar al cambiar de canción.
+        if not set_stream_volume(target):
             return
-        # Se refleja al toque; PropertiesChanged confirma el valor real.
         self.volume = round(target, 3)
         self.raw_volume = target
         self._on_change()
@@ -359,17 +430,14 @@ class YouTubePlayer:
         self.set_volume(self.raw_volume - VOLUME_STEP)
 
     def toggle_mute(self):
+        """Silencia sólo la pestaña de YouTube poniendo su volumen de página en
+        0. No toca el nivel del slider (que vive en PipeWire), así que al
+        desmutear se vuelve exactamente al volumen que había."""
         if not self.bus_name:
             return
-        if self.is_muted:
-            # Al desmutear, usamos el volumen guardado. 
-            # Si no hay uno válido, usamos 1.0 por seguridad.
-            self.set_volume(self._volume_before_mute if self._volume_before_mute > 0 else 1.0)
-            return
-        # Guardar el volumen actual ANTES de silenciar.
-        # Usamos raw_volume para tener la precisión máxima.
-        self._volume_before_mute = self.raw_volume
-        self.set_volume(0.0)
+        self.muted = not self.muted
+        self._write_volume(0.0 if self.muted else 1.0)
+        self._on_change()
 
     def raise_window(self):
         if not self.bus_name:
@@ -397,7 +465,9 @@ class YouTubePlayer:
 
     @property
     def is_muted(self):
-        return self.volume <= 0.001
+        # El mute es un estado propio (volumen de página en 0), no "el slider
+        # está en cero": bajar el slider a 0 no cuenta como mutear.
+        return self.muted
 
     def label(self):
         if not self.bus_name and not self.tab_id:
@@ -628,7 +698,7 @@ class VolumePopup:
             GLib.idle_add(self.player.set_volume, value)
 
     def _volume_glyph(self):
-        if self._display_volume <= 0.001:
+        if self.player.is_muted or self._display_volume <= 0.001:
             return '🔇'
         return '🔈' if self._display_volume < 0.5 else '🔊'
 
