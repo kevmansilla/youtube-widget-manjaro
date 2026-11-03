@@ -130,10 +130,12 @@ def browser_sink_ids():
 
 def set_stream_volume(value):
     """Fija el volumen (0..1) de todos los streams del navegador."""
-    pct = max(0, min(100, int(round(value * 100))))
+    # En valor crudo, no en porcentaje entero: a volúmenes bajos (2%) un paso
+    # de 1% sería un salto relativo enorme y el slider quedaría sin resolución.
+    raw = max(0, min(int(PA_NORM), int(round(value * PA_NORM))))
     ok = False
     for idx in browser_sink_ids():
-        if _pactl('set-sink-input-volume', str(idx), '%d%%' % pct):
+        if _pactl('set-sink-input-volume', str(idx), str(raw)):
             ok = True
     if not ok:
         _sink_ids['t'] = 0.0      # índices viejos: reconstruir en el próximo intento
@@ -569,6 +571,19 @@ SLIDER_X0, SLIDER_X1 = 34, 196
 SLIDER_Y = 16
 SLIDER_W, SLIDER_H = 240, 32
 KNOB_R = 7
+# El slider mapea posición <-> volumen en escala cúbica, como los mezcladores de
+# audio. La sonoridad percibida no es lineal: en escala lineal, escuchando bajo
+# (3%) todo el rango útil queda aplastado contra el borde izquierdo y mover el
+# knob un pixel salta de 3% a 10%. Con cubo, la mitad del recorrido es ~12%.
+SLIDER_CURVE = 3.0
+
+
+def pos_to_volume(pos):
+    return max(0.0, min(1.0, pos)) ** SLIDER_CURVE
+
+
+def volume_to_pos(vol):
+    return max(0.0, min(1.0, vol)) ** (1.0 / SLIDER_CURVE)
 # Arrastrar genera decenas de eventos por segundo: se manda a DBus como
 # mucho cada 120 ms, y siempre el valor final al soltar.
 SEND_INTERVAL = 0.12
@@ -673,7 +688,7 @@ class VolumePopup:
 
     def _value_from_x(self, x):
         span = SLIDER_X1 - SLIDER_X0
-        return min(1.0, max(0.0, (x - SLIDER_X0) / span))
+        return pos_to_volume((x - SLIDER_X0) / span)
 
     def _on_press(self, event):
         self._dragging = True
@@ -700,13 +715,15 @@ class VolumePopup:
     def _volume_glyph(self):
         if self.player.is_muted or self._display_volume <= 0.001:
             return '🔇'
-        return '🔈' if self._display_volume < 0.5 else '🔊'
+        # Según la posición del knob, no el valor crudo: con la curva cúbica el
+        # 50% del volumen cae recién al 79% del recorrido.
+        return '🔈' if volume_to_pos(self._display_volume) < 0.5 else '🔊'
 
     def _draw(self):
         c = self._canvas
         c.delete('all')
         v = self._display_volume
-        x = SLIDER_X0 + v * (SLIDER_X1 - SLIDER_X0)
+        x = SLIDER_X0 + volume_to_pos(v) * (SLIDER_X1 - SLIDER_X0)
         c.create_text(12, SLIDER_Y, text=self._volume_glyph(),
                       fill=TEXT_DIM, font=('sans', 11))
         c.create_line(SLIDER_X0, SLIDER_Y, SLIDER_X1, SLIDER_Y,
@@ -717,7 +734,10 @@ class VolumePopup:
         c.create_oval(x - KNOB_R, SLIDER_Y - KNOB_R,
                       x + KNOB_R, SLIDER_Y + KNOB_R,
                       fill='#ffffff', outline='')
-        c.create_text(SLIDER_X1 + 24, SLIDER_Y, text='%d%%' % round(v * 100),
+        # Abajo del 10% un entero esconde los ajustes finos (3% vs 3.4%), que es
+        # justo el rango donde se escucha en auriculares.
+        label = ('%.1f%%' % (v * 100)) if v < 0.1 else ('%d%%' % round(v * 100))
+        c.create_text(SLIDER_X1 + 24, SLIDER_Y, text=label,
                       fill=TEXT, font=('sans', 9))
 
     # --- ciclo de vida ---
